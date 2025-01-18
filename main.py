@@ -3,104 +3,68 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
-import io
 import base64
+from io import BytesIO
 
-# Load ONNX model
-model_path = "model/yolov8n.onnx"
-session = ort.InferenceSession(model_path)
 
-# Preprocess image
-def preprocess_image(image, target_size):
-    original_size = image.shape[:2]  # (height, width)
+def pil_to_base64(img):
+    buffered = BytesIO()
+    img.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    # Resize while maintaining aspect ratio
-    scale = min(target_size / original_size[1], target_size / original_size[0])
-    new_size = (int(original_size[1] * scale), int(original_size[0] * scale))
-    resized_image = cv2.resize(image, new_size, interpolation=cv2.INTER_LINEAR)
+def resize_with_aspect_ratio(image, size):
+    h, w, _ = image.shape
+    scale = size / max(h, w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized_image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    delta_w, delta_h = size - new_w, size - new_h
+    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+    left, right = delta_w // 2, delta_w - (delta_w // 2)
+    padded_image = cv2.copyMakeBorder(resized_image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    return padded_image
 
-    # Pad to target size
-    padded_image = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
-    top_left = ((target_size - new_size[1]) // 2, (target_size - new_size[0]) // 2)
-    padded_image[top_left[0]:top_left[0] + new_size[1], top_left[1]:top_left[1] + new_size[0]] = resized_image
+def predict(image):
+    session = ort.InferenceSession("model/yolov8n.onnx")
+    input_name = session.get_inputs()[0].name
+    image_data = np.transpose(image, (2, 0, 1)).astype(np.float32) / 255.0
+    image_data = np.expand_dims(image_data, axis=0)
+    predictions = session.run(None, {input_name: image_data})
+    return predictions
 
-    # Normalize and transpose to CHW format
-    image = padded_image.astype(np.float32) / 255.0
-    image = np.transpose(image, (2, 0, 1))[np.newaxis, ...]
-    return image, original_size, scale, top_left
-
-# Postprocess outputs
-def postprocess_detections(detections, original_size, scale, top_left, conf_threshold=0.25):
-    boxes, scores, class_ids = [], [], []
-    for detection in detections:
-        conf = detection[4]
-        if conf > conf_threshold:
-            x_center, y_center, width, height = detection[:4]
-            x_center = (x_center - top_left[1]) / scale
-            y_center = (y_center - top_left[0]) / scale
-            width /= scale
-            height /= scale
-            x1, y1 = x_center - width / 2, y_center - height / 2
-            x2, y2 = x_center + width / 2, y_center + height / 2
-            boxes.append([int(x1), int(y1), int(x2), int(y2)])
-            scores.append(float(conf))
-            class_ids.append(int(detection[5]))
-    return boxes, scores, class_ids
-
-# Visualize detections
-def draw_detections(image, boxes, scores, class_ids, class_names):
-    for box, score, class_id in zip(boxes, scores, class_ids):
-        x1, y1, x2, y2 = box
-        label = f"{class_names[class_id]}: {score:.2f}"
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    return image
-
-# GUI with Flet
 def main(page: ft.Page):
-    page.title = "YOLOv8 Detection"
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.scroll = "adaptive"
+    page.title = "YOLOv8 Image Prediction"
 
-    # Elements
-    result_image = ft.Image(width=640, height=640, fit=ft.ImageFit.CONTAIN)
-    file_picker = ft.FilePicker(on_result=lambda e: on_file_upload(e))
+    def process_image(e):
+        if not file_picker.result or not file_picker.result.files:
+            return
 
-    def on_file_upload(e: ft.FilePickerResultEvent):
-        if e.files:
-            # Read image
-            file_path = e.files[0].path
-            image = cv2.imread(file_path)
+        # Ambil path file dari file pertama yang dipilih
+        img_path = file_picker.result.files[0].path
+        image = cv2.imread(img_path)
+        resized_image = resize_with_aspect_ratio(image, 640)
+        predictions = predict(resized_image)
 
-            # Process image
-            input_image, original_size, scale, top_left = preprocess_image(image, 640)
-            inputs = {session.get_inputs()[0].name: input_image}
-            outputs = session.run(None, inputs)
+        # Convert resized image back to PIL format for display
+        display_image = Image.fromarray(cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB))
+        img_control.src_base64 = f"data:image/png;base64,{pil_to_base64(display_image)}"    
 
-            # Extract and process detections
-            detections = outputs[0][0]
-            boxes, scores, class_ids = postprocess_detections(detections, original_size, scale, top_left)
+        result_text.value = f"Predictions: {predictions}"
+        page.update()
 
-            # Draw detections
-            annotated_image = draw_detections(image.copy(), boxes, scores, class_ids, [f"class_{i}" for i in range(80)])
-            
-            # Convert to displayable format
-            annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(annotated_image)
-            buffer = io.BytesIO()
-            pil_image.save(buffer, format="PNG")
-            buffer.seek(0)
-            encoded_image = base64.b64encode(buffer.read()).decode("utf-8")
-            result_image.src_base64 = f"data:image/png;base64,{encoded_image}"
-            page.update()
 
-    # Layout
+    file_picker = ft.FilePicker(on_result=process_image)
     page.overlay.append(file_picker)
+
+    upload_button = ft.ElevatedButton("Upload Image", on_click=lambda _: file_picker.pick_files())
+    img_control = ft.Image(width=640, height=640, fit=ft.ImageFit.CONTAIN)
+    result_text = ft.Text("Predictions will appear here.")
+
     page.add(
-        ft.Text("Upload an image for YOLOv8 detection", size=20),
-        ft.ElevatedButton("Upload Image", on_click=lambda _: file_picker.pick_files()),
-        result_image
+        ft.Column([
+            upload_button,
+            img_control,
+            result_text
+        ])
     )
 
-# Run Flet app
 ft.app(target=main)

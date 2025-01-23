@@ -1,96 +1,94 @@
-import cv2
-import numpy as np
 import onnxruntime as ort
+import numpy as np
+import cv2
 
-def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
+# Load the ONNX model
+session = ort.InferenceSession("model/yolov8n.onnx")
+
+# Define the input and output names
+input_name = session.get_inputs()[0].name
+output_name = session.get_outputs()[0].name
+
+# Preprocess the input image
+def preprocess(image):
+    img = cv2.resize(image, (640, 640))  # Resize to model input size
+    img = img.astype(np.float32) / 255.0  # Normalize to [0, 1]
+    img = np.transpose(img, (2, 0, 1))  # Change to CHW format
+    img = np.expand_dims(img, axis=0)  # Add batch dimension
+    return img
+
+# Postprocess the outputs
+def postprocess(outputs, image_shape, conf_threshold=0.5, iou_threshold=0.4):
     """
-    Resize and pad image while keeping the aspect ratio and ensuring the output is exactly new_shape.
+    Convert raw model outputs into filtered bounding boxes.
+
+    Args:
+    - outputs: Raw model outputs
+    - image_shape: Original image dimensions (height, width)
+    - conf_threshold: Confidence threshold
+    - iou_threshold: Intersection Over Union threshold for NMS
+
+    Returns:
+    - List of bounding boxes: [x1, y1, x2, y2, confidence, class_id]
     """
-    shape = image.shape[:2]  # current shape [height, width]
-    if isinstance(new_shape, int):
-        new_shape = (new_shape, new_shape)
+    predictions = outputs[0]  # Extract the first (and only) batch
+    if predictions.shape != (1, 84, 8400):
+        raise ValueError(f"Unexpected output shape: {predictions.shape}")
 
-    # Scale ratio (new / old)
-    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+    predictions = predictions.squeeze(0)  # Remove batch dimension: [84, 8400]
 
-    # Compute padding
-    dw = new_shape[1] - new_unpad[0]
-    dh = new_shape[0] - new_unpad[1]
-    dw, dh = dw // 2, dh // 2  # divide padding into two sides
+    # Extract components
+    boxes = predictions[:4, :].T  # Bounding box coordinates: [8400, 4]
+    object_conf = predictions[4, :]  # Object confidence scores: [8400]
+    class_probs = predictions[5:, :].T  # Class probabilities: [8400, 80]
+    class_ids = np.argmax(class_probs, axis=1)  # Class IDs: [8400]
+    class_conf = np.max(class_probs, axis=1)  # Class confidence scores: [8400]
 
-    # Resize and pad
-    resized = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
-    padded = cv2.copyMakeBorder(
-        resized, dh, dh, dw, dw, cv2.BORDER_CONSTANT, value=color
+    # Combine object confidence with class confidence
+    scores = object_conf * class_conf
+
+    # Filter by confidence threshold
+    mask = scores > conf_threshold
+    if mask.sum() == 0:
+        return []  # No valid detections
+
+    boxes = boxes[mask]  # Filter boxes
+    scores = scores[mask]  # Filter scores
+    class_ids = class_ids[mask]  # Filter class IDs
+
+    # Rescale boxes to the original image size
+    h, w = image_shape[:2]
+    scale = np.array([w, h, w, h])
+    boxes = boxes * scale
+
+    # Perform Non-Maximum Suppression (NMS)
+    indices = cv2.dnn.NMSBoxes(
+        boxes.tolist(), scores.tolist(), conf_threshold, iou_threshold
     )
+    filtered_boxes = []
+    for i in indices:
+        idx = i[0]
+        filtered_boxes.append([*boxes[idx], scores[idx], class_ids[idx]])
 
-    return padded, (r, r), (dw, dh)
+    return filtered_boxes
 
-def preprocess(image_path):
-    # Load image
-    image = cv2.imread(image_path)
-    assert image is not None, f"Image not found: {image_path}"
+# Read and preprocess the image
+image = cv2.imread("input/under_roast (1)_mp4-0013.jpg")
+input_tensor = preprocess(image)
 
-    # Letterbox resize
-    img, ratio, dwdh = letterbox(image, new_shape=(640, 640))
+# Run inference
+outputs = session.run([output_name], {input_name: input_tensor})
 
-    # Convert BGR to RGB and normalize
-    img = img[:, :, ::-1].transpose(2, 0, 1)  # HWC to CHW
-    img = np.ascontiguousarray(img, dtype=np.float32)
-    img /= 255.0  # normalize to 0-1
+# Postprocess the outputs
+boxes = postprocess(outputs, image.shape)
 
-    # Ensure the image shape matches model input (N, C, H, W)
-    img = np.expand_dims(img, axis=0)  # add batch dimension
+# Draw the results on the image
+for box in boxes:
+    x1, y1, x2, y2, conf, cls = box
+    label = f"{int(cls)}: {conf:.2f}"
+    cv2.rectangle(image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+    cv2.putText(image, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    # Validate input dimensions
-    assert img.shape == (1, 3, 640, 640), f"Invalid input shape: {img.shape}, expected (1, 3, 640, 640)"
-
-    return img, image, ratio, dwdh
-
-def run_inference(onnx_path, image_path):
-    # Load ONNX model
-    session = ort.InferenceSession(onnx_path)
-
-    # Preprocess image
-    img, original_img, ratio, dwdh = preprocess(image_path)
-
-    # Run inference
-    inputs = {session.get_inputs()[0].name: img}
-    outputs = session.run(None, inputs)
-
-    return outputs, original_img, ratio, dwdh
-
-def postprocess(outputs, original_img, ratio, dwdh):
-    """Postprocess outputs to original image scale."""
-    detections = outputs[0]  # assuming single output
-
-    # Rescale boxes to original image size
-    detections[:, [0, 2]] -= dwdh[0]  # x padding
-    detections[:, [1, 3]] -= dwdh[1]  # y padding
-    detections[:, [0, 2]] /= ratio[0]
-    detections[:, [1, 3]] /= ratio[1]
-
-    # Clip boxes to image dimensions
-    detections[:, [0, 2]] = np.clip(detections[:, [0, 2]], 0, original_img.shape[1])
-    detections[:, [1, 3]] = np.clip(detections[:, [1, 3]], 0, original_img.shape[0])
-
-    return detections
-
-# Example usage
-onnx_path = 'model/yolov8n.onnx'
-image_path = r'input\under_roast (1)_mp4-0013.jpg'  # Replace with your image path
-
-outputs, original_img, ratio, dwdh = run_inference(onnx_path, image_path)
-detections = postprocess(outputs, original_img, ratio, dwdh)
-
-# Draw detections on the image
-for det in detections:
-    if len(det) >= 6:
-        x1, y1, x2, y2, conf, cls = det[:6]
-        label = f"{int(cls.item())} {conf:.2f}"
-        cv2.rectangle(original_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-        cv2.putText(original_img, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-cv2.imwrite('output.jpg', original_img)
-print("Detections saved to output.jpg")
+# Save the result
+cv2.imwrite("output/result.jpg", image)
+print("Inference complete. Result saved to 'output/result.jpg'.")

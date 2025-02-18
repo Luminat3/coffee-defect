@@ -3,7 +3,7 @@ import numpy as np
 import cv2
 
 # Load the ONNX model
-session = ort.InferenceSession("model/yolov8n.onnx")
+session = ort.InferenceSession("model/best640.onnx")
 
 # Define the input and output names
 input_name = session.get_inputs()[0].name
@@ -19,57 +19,48 @@ def preprocess(image):
 
 # Postprocess the outputs
 def postprocess(outputs, image_shape, conf_threshold=0.5, iou_threshold=0.4):
-    """
-    Convert raw model outputs into filtered bounding boxes.
-
-    Args:
-    - outputs: Raw model outputs
-    - image_shape: Original image dimensions (height, width)
-    - conf_threshold: Confidence threshold
-    - iou_threshold: Intersection Over Union threshold for NMS
-
-    Returns:
-    - List of bounding boxes: [x1, y1, x2, y2, confidence, class_id]
-    """
     predictions = outputs[0]  # Extract the first (and only) batch
-    if predictions.shape != (1, 84, 8400):
+    
+    # Check if the output shape matches the expected format
+    if predictions.shape[1] != 10:
         raise ValueError(f"Unexpected output shape: {predictions.shape}")
-
-    predictions = predictions.squeeze(0)  # Remove batch dimension: [84, 8400]
-
+    
+    predictions = predictions.squeeze(0)  # Remove batch dimension: [10, 8400]
+    
     # Extract components
     boxes = predictions[:4, :].T  # Bounding box coordinates: [8400, 4]
     object_conf = predictions[4, :]  # Object confidence scores: [8400]
-    class_probs = predictions[5:, :].T  # Class probabilities: [8400, 80]
+    class_probs = predictions[5:, :].T  # Class probabilities: [8400, num_classes]
     class_ids = np.argmax(class_probs, axis=1)  # Class IDs: [8400]
     class_conf = np.max(class_probs, axis=1)  # Class confidence scores: [8400]
 
     # Combine object confidence with class confidence
     scores = object_conf * class_conf
-
+    
     # Filter by confidence threshold
     mask = scores > conf_threshold
     if mask.sum() == 0:
         return []  # No valid detections
-
-    boxes = boxes[mask]  # Filter boxes
-    scores = scores[mask]  # Filter scores
-    class_ids = class_ids[mask]  # Filter class IDs
-
+    
+    boxes = boxes[mask]
+    scores = scores[mask]
+    class_ids = class_ids[mask]
+    
     # Rescale boxes to the original image size
     h, w = image_shape[:2]
     scale = np.array([w, h, w, h])
     boxes = boxes * scale
-
+    
     # Perform Non-Maximum Suppression (NMS)
     indices = cv2.dnn.NMSBoxes(
         boxes.tolist(), scores.tolist(), conf_threshold, iou_threshold
     )
+    
     filtered_boxes = []
-    for i in indices:
-        idx = i[0]
-        filtered_boxes.append([*boxes[idx], scores[idx], class_ids[idx]])
-
+    if len(indices) > 0:
+        for i in indices.flatten():
+            filtered_boxes.append([*boxes[i], scores[i], class_ids[i]])
+    
     return filtered_boxes
 
 # Read and preprocess the image

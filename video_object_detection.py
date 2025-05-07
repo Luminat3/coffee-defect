@@ -2,7 +2,7 @@ import cv2
 from yolov8 import YOLOv8
 
 # Path to the input video
-videoPath = "video/under_roast.mp4"
+videoPath = "video/roasted_beans (2).mp4"
 
 # Open video file
 cap = cv2.VideoCapture(videoPath)
